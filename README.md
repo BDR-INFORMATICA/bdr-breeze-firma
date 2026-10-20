@@ -162,3 +162,13 @@ manifest key), `checksums.txt`.
 - **Key rotation**: when LanternOps rotates the official manifest key,
   `official-release-key.pub` changes here — pull template updates before
   signing a release made with the new key.
+
+## Mantenimiento BDR de metadatos de publicacion
+
+El flujo de firma incorpora los campos de edicion y publicador de la plantilla oficial de Breeze 0.124.0. Los PKG se atestan con su identidad Developer ID Installer y su equipo de Apple antes de incluir esos datos en el manifiesto firmado. Las pruebas locales son `node scripts/verify-manifest.test.mjs`, `python3 scripts/test-release-metadata.py` y `node --test scripts/repair-release-metadata.test.mjs`.
+
+Para una version ya publicada, el flujo "Repair release metadata" descarga los archivos existentes, verifica su manifiesto con la clave publica BDR fijada en `bdr-release-key.pub`, contrasta todos los hashes y comprueba firma, notarizacion y publicador de ambos PKG. Solo anade `edition`, `signingIdentity` y `signingTeamId`. Mantiene los nombres y los hashes de los paquetes y no reconstruye binarios.
+
+Con `publish=false` solo valida y conserva un artefacto con el manifiesto anterior, su firma y la propuesta. Con `publish=true`, el segundo trabajo requiere la aprobacion del entorno protegido "signing". Antes de firmar exige que los cambios sean exactamente los metadatos verificados y que la clave privada existente corresponda a la clave publica fijada. Antes de publicar comprueba que el manifiesto original no haya cambiado. Conserva las copias durante 90 dias.
+
+La publicacion sustituye unicamente el manifiesto y su firma, con descarga y verificacion posterior. Esos dos archivos no se pueden sustituir atomicamente en GitHub; durante el intervalo los verificadores pueden rechazar una descarga y reintentar despues. Ante fallo se intenta restaurar la pareja anterior y el trabajo permanece fallido hasta revisar el resultado. Los paquetes, la version y los certificados se conservan. Para una vuelta atras posterior, restaurar solo esa pareja desde el artefacto original y verificarla antes de sincronizar el servidor.

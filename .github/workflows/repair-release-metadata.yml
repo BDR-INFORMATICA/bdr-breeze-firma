@@ -1,0 +1,152 @@
+name: Repair release metadata
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Existing release version without v
+        required: true
+        default: 0.124.0
+        type: string
+      publish:
+        description: Publish only the repaired manifest and its signature
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bdr-release-metadata-${{ inputs.version }}
+  cancel-in-progress: false
+
+env:
+  VERSION: ${{ inputs.version }}
+  INSTALLER_IDENTITY: "Developer ID Installer: BDR Informatica y Comunicaciones S.L. (G4ZJD5Y96T)"
+  INSTALLER_TEAM: G4ZJD5Y96T
+
+jobs:
+  verify:
+    name: Verify existing release and package publisher
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - name: Run isolated tests
+        run: |
+          node scripts/verify-manifest.test.mjs
+          python3 scripts/test-release-metadata.py
+          node --test scripts/repair-release-metadata.test.mjs
+      - name: Download existing release without modifying it
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]
+          mkdir payload result
+          gh release download "v${VERSION}" --repo "$GITHUB_REPOSITORY" --dir payload
+          cp payload/release-artifact-manifest.json result/original-manifest.json
+          cp payload/release-artifact-manifest.json.ed25519 result/original-manifest.json.ed25519
+      - name: Verify original manifest before executing package tools
+        run: |
+          node scripts/verify-manifest.mjs verify \
+            --manifest result/original-manifest.json \
+            --signature result/original-manifest.json.ed25519 \
+            --key bdr-release-key.pub --repository "$GITHUB_REPOSITORY" --release "v${VERSION}"
+          for name in breeze-agent-darwin-amd64.pkg breeze-agent-darwin-arm64.pkg; do
+            node scripts/verify-manifest.mjs check-asset \
+              --manifest result/original-manifest.json --name "$name" --file "payload/$name" \
+              --forbid-signing-input
+          done
+      - name: Attest both unchanged macOS packages
+        run: |
+          set -euo pipefail
+          : > result/macos.tsv
+          for name in breeze-agent-darwin-amd64.pkg breeze-agent-darwin-arm64.pkg; do
+            scripts/attest-macos-pkg.sh "payload/$name" "$name" \
+              "$INSTALLER_IDENTITY" "$INSTALLER_TEAM" >> result/macos.tsv
+            xcrun stapler validate "payload/$name"
+            spctl -a -vv -t install "payload/$name"
+          done
+      - name: Verify all binary hashes and build metadata repair
+        run: |
+          node scripts/repair-release-metadata.mjs build \
+            --manifest result/original-manifest.json \
+            --signature result/original-manifest.json.ed25519 \
+            --key bdr-release-key.pub --assets payload --attest result/macos.tsv \
+            --repository "$GITHUB_REPOSITORY" --release "v${VERSION}" \
+            --identity "$INSTALLER_IDENTITY" --team "$INSTALLER_TEAM" \
+            --output result/release-artifact-manifest.json
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: bdr-release-metadata-${{ inputs.version }}
+          path: result/
+          if-no-files-found: error
+          retention-days: 90
+
+  publish:
+    name: Publish verified metadata repair
+    needs: verify
+    if: inputs.publish
+    runs-on: ubuntu-24.04
+    environment: signing
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: bdr-release-metadata-${{ inputs.version }}
+          path: result
+      - name: Recheck existing release metadata has not changed
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir current
+          gh release download "v${VERSION}" --repo "$GITHUB_REPOSITORY" --dir current \
+            --pattern release-artifact-manifest.json --pattern release-artifact-manifest.json.ed25519
+          cmp current/release-artifact-manifest.json result/original-manifest.json
+          cmp current/release-artifact-manifest.json.ed25519 result/original-manifest.json.ed25519
+      - name: Sign only the verified metadata changes
+        env:
+          RELEASE_MANIFEST_ED25519_PRIVATE_KEY: ${{ secrets.RELEASE_MANIFEST_ED25519_PRIVATE_KEY }}
+        run: |
+          node scripts/repair-release-metadata.mjs sign \
+            --original result/original-manifest.json \
+            --original-signature result/original-manifest.json.ed25519 \
+            --manifest result/release-artifact-manifest.json --attest result/macos.tsv \
+            --key bdr-release-key.pub --repository "$GITHUB_REPOSITORY" --release "v${VERSION}" \
+            --identity "$INSTALLER_IDENTITY" --team "$INSTALLER_TEAM" \
+            --output result/release-artifact-manifest.json.ed25519
+      - name: Replace only manifest and signature with rollback on failure
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          changed=0
+          rollback() {
+            status=$?
+            trap - EXIT
+            if [ "$status" -ne 0 ] && [ "$changed" -eq 1 ]; then
+              echo "Restoring the previous manifest and signature"
+              gh release upload "v${VERSION}" --repo "$GITHUB_REPOSITORY" --clobber \
+                current/release-artifact-manifest.json current/release-artifact-manifest.json.ed25519 || true
+            fi
+            exit "$status"
+          }
+          trap rollback EXIT
+          changed=1
+          gh release upload "v${VERSION}" --repo "$GITHUB_REPOSITORY" --clobber \
+            result/release-artifact-manifest.json result/release-artifact-manifest.json.ed25519
+          mkdir verified
+          gh release download "v${VERSION}" --repo "$GITHUB_REPOSITORY" --dir verified \
+            --pattern release-artifact-manifest.json --pattern release-artifact-manifest.json.ed25519
+          cmp verified/release-artifact-manifest.json result/release-artifact-manifest.json
+          cmp verified/release-artifact-manifest.json.ed25519 result/release-artifact-manifest.json.ed25519
+          node scripts/verify-manifest.mjs verify \
+            --manifest verified/release-artifact-manifest.json \
+            --signature verified/release-artifact-manifest.json.ed25519 \
+            --key bdr-release-key.pub --repository "$GITHUB_REPOSITORY" --release "v${VERSION}"
+          changed=0
+          echo "Published metadata repair; all package assets retained"
